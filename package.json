@@ -1,0 +1,12 @@
+{
+  "name": "abhihar-backend",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "mysql2": "^3.12.0"
+  }
+}
