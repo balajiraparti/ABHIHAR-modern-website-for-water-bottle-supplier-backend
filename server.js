@@ -3,9 +3,11 @@ import { createHmac, timingSafeEqual, randomBytes, pbkdf2Sync } from 'crypto'
 import fs from 'fs'
 import path from 'path'
 import { fileURLToPath } from 'url'
-import mysql from 'mysql2/promise'
+import { MongoClient, ObjectId } from 'mongodb'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
+
+let cachedDb = null
 
 function loadEnv() {
   const envPath = path.join(__dirname, '.env')
@@ -26,24 +28,20 @@ loadEnv()
 
 const PORT = Number(process.env.PORT || 5174)
 const JWT_SECRET = process.env.JWT_SECRET || ''
-const ADMIN_EMAIL = (process.env.ADMIN_EMAIL || 'freegptmail1@gmail.com').toLowerCase()
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '123456'
-const DB_HOST = process.env.DB_HOST || 'localhost'
-const DB_PORT = Number(process.env.DB_PORT || 3306)
-const DB_USER = process.env.DB_USER || 'root'
-const DB_PASSWORD = process.env.DB_PASSWORD || '1234'
+const ADMIN_EMAIL = (process.env.ADMIN_EMAIL || 'admin@gmail.com').toLowerCase()
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'Admin@1234'
+const MONGO_URI = process.env.MONGO_URI || 'mongodb://localhost:27017'
 const DB_NAME = process.env.DB_NAME || 'abhihar'
+const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*'
 
-const pool = mysql.createPool({
-  host: DB_HOST,
-  port: DB_PORT,
-  user: DB_USER,
-  password: DB_PASSWORD,
-  database: DB_NAME,
-  connectionLimit: 10,
-  waitForConnections: true,
-
-})
+async function getDb() {
+  if (cachedDb) return cachedDb
+  const client = new MongoClient(MONGO_URI)
+  await client.connect()
+  const db = client.db(DB_NAME)
+  cachedDb = db
+  return db
+}
 
 function base64UrlEncode(input) {
   return Buffer.from(input)
@@ -118,7 +116,10 @@ function send(res, status, data) {
   const body = JSON.stringify(data)
   res.writeHead(status, {
     'Content-Type': 'application/json',
-    'Cache-Control': 'no-store'
+    'Cache-Control': 'no-store',
+    'Access-Control-Allow-Origin': ALLOWED_ORIGIN,
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS'
   })
   res.end(body)
 }
@@ -130,30 +131,12 @@ function getToken(req) {
   return token
 }
 
-function parseItems(value) {
-  if (Array.isArray(value)) return value
-  if (Buffer.isBuffer(value)) {
-    try {
-      return JSON.parse(value.toString('utf8'))
-    } catch {
-      return []
-    }
-  }
-  if (typeof value === 'string') {
-    try {
-      return JSON.parse(value)
-    } catch {
-      return []
-    }
-  }
-  if (value && typeof value === 'object') {
-    return Array.isArray(value) ? value : []
-  }
-  return []
-}
-
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url || '/', `http://${req.headers.host}`)
+
+  if (req.method === 'OPTIONS') {
+    return send(res, 200, { ok: true })
+  }
 
   if (url.pathname === '/api/health') {
     return send(res, 200, { ok: true })
@@ -166,31 +149,37 @@ const server = http.createServer(async (req, res) => {
     const password = String(body.password || '')
     if (!email || !password) return send(res, 400, { error: 'Email and password required' })
     try {
+      const db = await getDb()
+      const usersCol = db.collection('users')
+
       if (email === ADMIN_EMAIL && password === ADMIN_PASSWORD) {
-        const [rows] = await pool.query('select id from users where email = ?', [email])
-        let userId = rows?.[0]?.id
-        if (!userId) {
+        let user = await usersCol.findOne({ email })
+        if (!user) {
           const salt = randomBytes(16).toString('hex')
           const hash = hashPassword(password, salt)
-          const [result] = await pool.query(
-            'insert into users (email, role, password_hash, password_salt) values (?, ?, ?, ?)',
-            [email, 'admin', hash, salt]
-          )
-          userId = result.insertId
+          const result = await usersCol.insertOne({
+            email,
+            role: 'admin',
+            password_hash: hash,
+            password_salt: salt,
+            created_at: new Date()
+          })
+          user = { _id: result.insertedId, email, role: 'admin' }
         } else {
-          await pool.query('update users set role = ? where id = ?', ['admin', userId])
+          await usersCol.updateOne({ _id: user._id }, { $set: { role: 'admin' } })
         }
+        const userId = user._id.toString()
         const { token, payload } = createJwt({ uid: userId, email, role: 'admin' }, JWT_SECRET)
         return send(res, 200, { token, user: { email: payload.email, role: payload.role, iat: payload.iat, exp: payload.exp } })
       }
 
-      const [rows] = await pool.query('select id, email, role, password_hash, password_salt from users where email = ?', [email])
-      const user = rows?.[0]
+      const user = await usersCol.findOne({ email })
       if (!user) return send(res, 401, { error: 'Invalid credentials' })
       const computed = hashPassword(password, user.password_salt)
       if (computed !== user.password_hash) return send(res, 401, { error: 'Invalid credentials' })
       const role = user.role || 'user'
-      const { token, payload } = createJwt({ uid: user.id, email, role }, JWT_SECRET)
+      const userId = user._id.toString()
+      const { token, payload } = createJwt({ uid: userId, email, role }, JWT_SECRET)
       return send(res, 200, { token, user: { email: payload.email, role: payload.role, iat: payload.iat, exp: payload.exp } })
     } catch (e) {
       console.error('Login error', e)
@@ -209,15 +198,20 @@ const server = http.createServer(async (req, res) => {
     const hash = hashPassword(password, salt)
     const role = email === ADMIN_EMAIL ? 'admin' : 'user'
     try {
-      const [result] = await pool.query(
-        'insert into users (email, role, password_hash, password_salt) values (?, ?, ?, ?)',
-        [email, role, hash, salt]
-      )
-      const userId = result.insertId
+      const db = await getDb()
+      const usersCol = db.collection('users')
+      const result = await usersCol.insertOne({
+        email,
+        role,
+        password_hash: hash,
+        password_salt: salt,
+        created_at: new Date()
+      })
+      const userId = result.insertedId.toString()
       const { token, payload } = createJwt({ uid: userId, email, role }, JWT_SECRET)
       return send(res, 201, { token, user: { email: payload.email, role: payload.role, iat: payload.iat, exp: payload.exp } })
     } catch (e) {
-      if (e?.code === 'ER_DUP_ENTRY') return send(res, 409, { error: 'Email already registered' })
+      if (e?.code === 11000) return send(res, 409, { error: 'Email already registered' })
       console.error('Signup error', e)
       return send(res, 500, { error: 'Sign up failed' })
     }
@@ -239,14 +233,14 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === 'GET') {
       try {
+        const db = await getDb()
+        const ordersCol = db.collection('orders')
         if (payload.role === 'admin') {
-          const [rows] = await pool.query('select * from orders order by created_at desc')
-          const orders = (rows || []).map((row) => ({ ...row, items: parseItems(row.items) }))
-          return send(res, 200, { orders })
+          const orders = await ordersCol.find({}).sort({ created_at: -1 }).toArray()
+          return send(res, 200, { orders: orders.map(o => ({ ...o, id: o._id.toString() })) })
         }
-        const [rows] = await pool.query('select * from orders where user_id = ? order by created_at desc', [payload.uid])
-        const orders = (rows || []).map((row) => ({ ...row, items: parseItems(row.items) }))
-        return send(res, 200, { orders })
+        const orders = await ordersCol.find({ user_id: payload.uid }).sort({ created_at: -1 }).toArray()
+        return send(res, 200, { orders: orders.map(o => ({ ...o, id: o._id.toString() })) })
       } catch (e) {
         console.error('Load orders error', e)
         return send(res, 500, { error: 'Failed to load orders' })
@@ -261,12 +255,16 @@ const server = http.createServer(async (req, res) => {
         return send(res, 400, { error: 'Invalid order payload' })
       }
       try {
-        const [result] = await pool.query(
-          'insert into orders (user_id, email, items, total) values (?, ?, ?, ?)',
-          [payload.uid, payload.email, JSON.stringify(items), total]
-        )
-        const [rows] = await pool.query('select * from orders where id = ?', [result.insertId])
-        const order = rows?.[0] ? { ...rows[0], items: parseItems(rows[0].items) } : null
+        const db = await getDb()
+        const ordersCol = db.collection('orders')
+        const result = await ordersCol.insertOne({
+          user_id: payload.uid,
+          email: payload.email,
+          items,
+          total,
+          created_at: new Date()
+        })
+        const order = { _id: result.insertedId, user_id: payload.uid, email: payload.email, items, total, created_at: new Date(), id: result.insertedId.toString() }
         return send(res, 201, { order })
       } catch (e) {
         console.error('Create order error', e)
@@ -281,10 +279,12 @@ const server = http.createServer(async (req, res) => {
     const payload = verifyJwt(token, JWT_SECRET)
     if (!payload) return send(res, 401, { error: 'Unauthorized' })
     if (payload.role !== 'admin') return send(res, 403, { error: 'Forbidden' })
-    const orderId = Number(url.pathname.split('/').pop())
-    if (!Number.isFinite(orderId)) return send(res, 400, { error: 'Invalid order id' })
+    const orderId = url.pathname.split('/').pop()
+    if (!orderId) return send(res, 400, { error: 'Invalid order id' })
     try {
-      await pool.query('delete from orders where id = ?', [orderId])
+      const db = await getDb()
+      const ordersCol = db.collection('orders')
+      await ordersCol.deleteOne({ _id: new ObjectId(orderId) })
       return send(res, 200, { ok: true })
     } catch (e) {
       console.error('Delete order error', e)
